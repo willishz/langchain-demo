@@ -8,7 +8,7 @@ from rich import print
 from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from langchain.agents.structured_output import ToolStrategy
+from langchain.agents.structured_output import ToolStrategy, ProviderStrategy
 from langchain.agents import create_agent
 from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse, wrap_tool_call
 from langchain.agents.middleware.types import AgentState, dynamic_prompt
@@ -92,7 +92,7 @@ def handle_tool_errors(request, handler):
 @dynamic_prompt
 def user_role_prompt(request: ModelRequest) -> str:
     """Generate system prompt based on user role."""
-    user_role = request.runtime.context.get("user_role", "user")
+    user_role = request.runtime.context.user_role
     base_prompt = "You are a helpful assistant."
 
     if user_role == "expert":
@@ -110,7 +110,7 @@ def get_weather_for_location(city: str) -> str:
 
 
 @dataclass
-class Context(TypedDict):
+class Context:
     """自定义运行时上下文模式。"""
     user_id: str | None
     user_role: str | None
@@ -135,7 +135,7 @@ class ResponseFormat:
 @tool
 def get_user_location(runtime: ToolRuntime[Context]) -> str:
     """根据用户 ID 检索用户信息。"""
-    user_id = runtime.context.get("user_id")
+    user_id = runtime.context.user_id
     return "Florida" if user_id == "1" else "SF"
 
 
@@ -153,10 +153,10 @@ agent = create_agent(
     model=advanced_model,
     system_prompt=SYSTEM_PROMPT,
     tools=[get_user_location, get_weather_for_location],
-    middleware=[state_based_tools, user_role_prompt],
+    middleware=[state_based_tools, user_role_prompt, handle_tool_errors],
     state_schema=AuthAgentState,
     context_schema=Context,
-    response_format=ToolStrategy(ResponseFormat),
+    response_format=ProviderStrategy(ResponseFormat),
     checkpointer=checkpointer,
 )
 
