@@ -1,17 +1,20 @@
 import os
+import re
 from dataclasses import dataclass
 from langchain.tools import tool, ToolRuntime
 from dotenv import load_dotenv
 from langchain_core.messages import ToolMessage, SystemMessage, HumanMessage, AIMessage, RemoveMessage
 from typing import Any, Literal
-from langchain.agents.middleware import after_agent, AgentState
+from langchain.agents.middleware import after_agent, AgentState, HumanInTheLoopMiddleware, ModelCallLimitMiddleware, \
+    ToolCallLimitMiddleware, ModelFallbackMiddleware, PIIMiddleware, ModelRetryMiddleware, LLMToolEmulator, \
+    ShellToolMiddleware, HostExecutionPolicy
 from langchain.messages import AIMessage
 from langgraph.config import get_stream_writer
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import Item
-from langgraph.types import Command
+from langgraph.types import Command, StreamPart
 from rich import print
 from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import InMemorySaver
@@ -270,9 +273,43 @@ agent = create_agent(
                 CustomMiddleware(),
                 SummarizationMiddleware(
                     model=model_name,
-                    trigger=("tokens", 4000),
-                    keep=("messages", 1)
-                )],
+                    trigger=[
+                        ("tokens", 2000),
+                        ("messages", 3),
+                    ],
+                    keep=("messages", 3)
+                ),
+                HumanInTheLoopMiddleware(
+                    interrupt_on={
+                        "get_weather_for_location": {
+                            "allowed_decisions": ["approve", "edit", "reject"],
+                        }
+                    }
+                ),
+                ModelCallLimitMiddleware(
+                    thread_limit=20,
+                    run_limit=10,
+                    exit_behavior="error",
+                ),
+                ToolCallLimitMiddleware(
+                    tool_name="search",
+                    thread_limit=5,
+                    run_limit=3,
+                ),
+                ModelFallbackMiddleware(
+                    "deepseek-chat"
+                ),
+                PIIMiddleware(
+                    "api_key",
+                    detector=r"sk-[a-zA-Z0-9]{32}",
+                    strategy="block",
+                ),
+                ModelRetryMiddleware(
+                    max_retries=3,
+                    backoff_factor=2.0,
+                    initial_delay=1.0,
+                ),
+                ],
     state_schema=CustomState,
     context_schema=UserContext,
     # response_format=ToolStrategy(ResponseFormat), # deepseek-v4-flash thinking模型不能自定义ResponseFormat
