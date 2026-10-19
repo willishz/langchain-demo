@@ -1,6 +1,12 @@
 import os
 import re
+import json
+import threading
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from deepagents.backends import StateBackend, CompositeBackend, StoreBackend, FilesystemBackend
 from langchain.tools import tool, ToolRuntime
 from dotenv import load_dotenv
 from langchain_core.messages import ToolMessage, SystemMessage, HumanMessage, AIMessage, RemoveMessage
@@ -20,6 +26,7 @@ from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langchain.agents import create_agent
+from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse, wrap_tool_call, \
     SummarizationMiddleware
 from langchain.agents.middleware.types import AgentState, dynamic_prompt, AgentMiddleware, after_model, before_model
@@ -32,6 +39,11 @@ load_dotenv()
 
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+# 从 .env 读取 memories 根目录,并在末尾拼上 /memories 子目录作为落盘路径。
+# .env 里 MEMORIES_PATH=~/workspace/langchain-demo,所以最终落地到该目录下的 memories/。
+MEMORIES_PATH = Path(os.path.expanduser(os.getenv("MEMORIES_PATH", "~"))).joinpath("memories")
+MEMORIES_PATH.mkdir(parents=True, exist_ok=True)
 
 model_name = "deepseek-v4-flash"
 
@@ -227,6 +239,54 @@ class ResponseSafety(BaseModel):
     evaluation: Literal["safe", "unsafe"]
 
 
+class ConversationLoggerMiddleware(AgentMiddleware):
+    """将每一轮大模型对话(用户输入、模型回复、工具调用)持久化到本地 memories 目录。
+
+    FilesystemMiddleware 只是给智能体挂载了读写文件的工具,模型不主动写就不落地;
+    本中间件在 before_model 钩子里把即将送给模型的 messages 落盘,
+    在 after_model 钩子里把模型刚产生的回复落盘,从而保证完整对话记录。
+    """
+
+    def __init__(self, log_dir: str) -> None:
+        self._log_dir = Path(log_dir)
+        self._lock = threading.Lock()
+
+    def _dump(self, messages: list, tag: str) -> None:
+        """把消息序列以 JSON Lines 形式追加写入当日日志文件。"""
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = self._log_dir / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+        records = []
+        for msg in messages:
+            content = msg.content if hasattr(msg, "content") else str(msg)
+            records.append({
+                "type": getattr(msg, "type", type(msg).__name__),
+                "name": getattr(msg, "name", None),
+                "content": content,
+                "tool_calls": getattr(msg, "tool_calls", None),
+                "tool_call_id": getattr(msg, "tool_call_id", None),
+            })
+        line = json.dumps({
+            "ts": datetime.now().isoformat(),
+            "tag": tag,
+            "messages": records,
+        }, ensure_ascii=False)
+        with self._lock:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def before_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        """模型调用前:记录即将送入模型的全部消息。"""
+        self._dump(state.get("messages", []), "before_model")
+        return None
+
+    def after_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        """模型调用后:记录模型最新产生的回复。"""
+        messages = state.get("messages", [])
+        if messages:
+            self._dump([messages[-1]], "after_model")
+        return None
+
+
 @after_agent(can_jump_to=["end"])
 def safety_guardrail(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
     """Model-based guardrail: Use an LLM to evaluate response safety."""
@@ -309,6 +369,15 @@ agent = create_agent(
                     backoff_factor=2.0,
                     initial_delay=1.0,
                 ),
+                FilesystemMiddleware(
+                    backend=FilesystemBackend(root_dir=str(MEMORIES_PATH)),
+                    tools=["read_file", "ls", "write_file", "edit_file", "glob", "grep"],
+                    tool_token_limit_before_evict=20000,
+                    system_prompt="always write to the filesystem",  # Optional custom addition to the system prompt
+                ),
+                ConversationLoggerMiddleware(
+                    log_dir=str(MEMORIES_PATH)
+                )
                 ],
     state_schema=CustomState,
     context_schema=UserContext,
@@ -341,9 +410,81 @@ config = {
 # )
 # print(response)
 
-for chunk in agent.stream(
+
+def dump_history_to_memories(graph, cfg, log_dir: str) -> Path:
+    """直接 read checkpointer 持久化:遍历图的完整状态历史,把对话消息写成本地 JSONL。
+
+    与 ConversationLoggerMiddleware 不同:checkpointer 保存的是经过裁剪/汇总等中间件
+    处理之前的「原始」消息序列,且不受 RemoveMessage 影响。这里我们从最旧的
+    快照开始顺序回放,得到一条完整的对话轨迹。
+    """
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    out_file = log_path / f"history-{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+
+    snapshots = list(graph.get_state_history(cfg))  # 最新快照在前
+    snapshots.reverse()  # 改为从旧到新
+
+    def _serializable(obj: Any) -> Any:
+        """把消息/工具调用等对象转成可 JSON 序列化的结构。"""
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if isinstance(obj, (list, tuple)):
+            return [_serializable(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _serializable(v) for k, v in obj.items()}
+        return obj
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        for snap in snapshots:
+            values = snap.values or {}
+            messages = values.get("messages", [])
+            record = {
+                "ts": datetime.now().isoformat(),
+                "checkpoint_id": (snap.config or {}).get("configurable", {}).get("checkpoint_id"),
+                "next": list(snap.next or ()),
+                "messages": _serializable(messages),
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return out_file
+
+
+# 运行智能体第一轮。HITL 会在需要审批工具时中断;取决于 langgraph 版本,
+# 中断可能以 GraphInterrupt 异常抛出,也可能只是把线程停在 interrupted 状态
+# (invoke 正常返回、state.next 非空)。两种情况都要处理,否则线程会卡在
+# 「AIMessage(tool_calls) 之后没有 ToolMessage」的暂停态,第二轮复用同一
+# thread_id 时 deepseek 会因此报 400(BadRequest)。
+try:
+    agent.invoke(
         {
             "messages": HumanMessage("what is the weather outside?"),
+            "user_preferences": {"device": "ios", "authenticated": True},
+        },
+        config=config,
+        context=UserContext(user_id="1", user_role="expert"),
+    )
+except Exception as e:  # GraphInterrupt 等
+    print(f"[yellow]invoke 抛出: {type(e).__name__}: {e}[/yellow]")
+
+# 统一用 state.next 判断是否仍处于中断/暂停态;若是,逐个 approve 放行直到真正跑完
+while True:
+    state = agent.get_state(config)
+    if not state.next:
+        break
+    print(f"[cyan]检测到线程暂停(next={state.next}),自动 approve 放行工具调用…[/cyan]")
+    agent.invoke(
+        Command(resume={"decisions": [{"type": "approve"}]}),
+        config=config,
+        context=UserContext(user_id="1", user_role="expert"),
+    )
+
+history_file = dump_history_to_memories(agent, config, str(MEMORIES_PATH))
+print(f"[green]第一轮对话历史已落盘: {history_file}[/green]")
+
+# 运行后也保留原 stream 输出,便于在终端观察每步事件
+for chunk in agent.stream(
+        {
+            "messages": HumanMessage("what is the weather outside again?"),
             "user_preferences": {"device": "ios", "authenticated": True},
         },
         stream_mode=["values", "updates", "custom"],
@@ -352,11 +493,23 @@ for chunk in agent.stream(
         version="v2", ):
     print(chunk, "[bold yellow]==========================[/bold yellow]", flush=True)
     # # Each chunk contains the full state at that point
-    # latest_message = chunk["messages"][-1]
-    # if latest_message.content:
-    #     if isinstance(latest_message, HumanMessage):
-    #         print(f"User: {latest_message.content}")
-    #     elif isinstance(latest_message, AIMessage):
-    #         print(f"Agent: {latest_message.content}")
-    # elif latest_message.tool_calls:
-    #     print(f"Calling tools: {[tc['name'] for tc in latest_message.tool_calls]}")
+    # latest_message = chunk["short_messages"][-1] if "short_messages" in chunk else None
+
+# 第二轮结束后再次把 checkpointer 历史落盘(追加到同一文件)
+dump_history_to_memories(agent, config, str(MEMORIES_PATH))
+print(f"[green]第二轮历史已落盘[/green]")
+
+# 第二轮流式执行同样可能再次触发 HITL 中断,同样需要 approve 放行,避免线程残留暂停态
+while True:
+    state = agent.get_state(config)
+    if not state.next:
+        break
+    print(f"[cyan]第二轮检测到线程暂停(next={state.next}),自动 approve 放行…[/cyan]")
+    for chunk in agent.stream(
+            Command(resume={"decisions": [{"type": "approve"}]}),
+            stream_mode=["values", "updates", "custom"],
+            config=config,
+            context=UserContext(user_id="1", user_role="expert"),
+            version="v2",
+    ):
+        print(chunk, "[bold yellow]==========================[/bold yellow]", flush=True)
